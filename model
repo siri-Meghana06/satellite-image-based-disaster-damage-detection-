@@ -1,0 +1,149 @@
+import torch
+import torch.nn as nn
+from PIL import Image
+import numpy as np
+import io
+import torchvision.transforms as transforms
+import cv2  # Ensure this is installed: pip install opencv-python
+
+############################################
+# YOUR FRIEND'S ARCHITECTURE
+############################################
+class Encoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3,32,3,padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(32,64,3,padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+
+    def forward(self,x):
+        f1 = self.conv1(x)
+        f2 = self.conv2(f1)
+        return f1,f2
+
+class SiameseUNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = Encoder()
+        self.up1 = nn.ConvTranspose2d(64,32,2,stride=2)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(64,32,3,padding=1),
+            nn.ReLU()
+        )
+        self.up2 = nn.ConvTranspose2d(32,16,2,stride=2)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(16,16,3,padding=1),
+            nn.ReLU()
+        )
+        self.out = nn.Conv2d(16,1,1)
+
+    def forward(self,A,B):
+        A1,A2 = self.encoder(A)
+        B1,B2 = self.encoder(B)
+        
+        diff2 = torch.abs(A2-B2)
+        diff1 = torch.abs(A1-B1)
+
+        x = self.up1(diff2)
+        x = torch.cat([x,diff1],dim=1)
+        x = self.conv1(x)
+        x = self.up2(x)
+        x = self.conv2(x)
+        return self.out(x)
+
+############################################
+# API CONNECTION LOGIC
+############################################
+class DamageAssessor:
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        self.model = SiameseUNet().to(self.device)
+        
+        try:
+            self.model.load_state_dict(torch.load('model.pth', map_location=self.device, weights_only=False))
+            print("✅ Real AI Model weights loaded successfully!")
+        except Exception as e:
+            print(f"⚠️ Could not load weights: {e}")
+            
+        self.model.eval()
+
+        self.transform = transforms.Compose([
+            transforms.Resize((256, 256)), 
+            transforms.ToTensor(),
+            # Normalizing helps the model ignore global lighting differences
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def predict(self, pre_image_bytes, post_image_bytes):
+        try:
+            pre_img = Image.open(io.BytesIO(pre_image_bytes)).convert("RGB")
+            post_img = Image.open(io.BytesIO(post_image_bytes)).convert("RGB")
+            
+            # Ensure post-image matches pre-image dimensions
+            post_img = post_img.resize(pre_img.size) 
+            original_size = pre_img.size
+            
+            pre_tensor = self.transform(pre_img).unsqueeze(0).to(self.device)
+            post_tensor = self.transform(post_img).unsqueeze(0).to(self.device)
+
+            with torch.no_grad():
+                output = self.model(pre_tensor, post_tensor)
+                pred = torch.sigmoid(output)
+                # THRESHOLD: Increased to 0.85 to be stricter on what counts as "damage"
+                mask_raw = pred.squeeze().cpu().numpy() > 0.85 
+
+            # --- NOISE REDUCTION (MORPHOLOGY) ---
+            # 1. Convert boolean mask to uint8 (0 or 255)
+            mask_uint8 = (mask_raw * 255).astype(np.uint8)
+
+            # 2. Define a kernel (5x5 is a good balance for satellite imagery)
+            kernel = np.ones((5, 5), np.uint8)
+
+            # 3. OPENING: Removes small white noise (dots) from the background
+            mask_cleaned = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
+            
+            # 4. CLOSING: Fills small holes within the detected damage areas
+            mask_cleaned = cv2.morphologyEx(mask_cleaned, cv2.MORPH_CLOSE, kernel)
+
+            # Convert back to boolean for processing
+            mask = mask_cleaned > 0
+
+            # --- CALCULATE DAMAGE ---
+            damage_ratio = mask.sum() / mask.size
+            damage_stats = {"Minor": 0, "Major": 0} 
+            
+            if damage_ratio < 0.005: # Adjusted threshold for "No Damage"
+                severity = "No Significant Damage"
+                color = [0, 255, 0, 0] # Fully transparent
+            elif damage_ratio < 0.03:
+                severity = "Minor Damage"
+                color = [255, 255, 0, 140] # Yellow
+                damage_stats["Minor"] = int(mask.sum())
+            else:
+                severity = "Major Damage"
+                color = [255, 0, 0, 160] # Red
+                damage_stats["Major"] = int(mask.sum())
+
+            # --- CREATE VISUAL OVERLAY ---
+            color_mask = np.zeros((mask.shape[0], mask.shape[1], 4), dtype=np.uint8)
+            color_mask[mask] = color
+
+            mask_img = Image.fromarray(color_mask, mode="RGBA").resize(original_size, Image.NEAREST)
+            post_img_rgba = post_img.convert("RGBA")
+            final_output = Image.alpha_composite(post_img_rgba, mask_img).convert("RGB")
+
+            damage_stats["Overall_Severity"] = severity
+
+            return final_output, damage_stats
+
+        except Exception as e:
+            print(f"🔥 Prediction error: {e}")
+            raise e
