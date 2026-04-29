@@ -1,0 +1,290 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from datasets import load_dataset # Added this import
+
+# --- Start of added code for data loading and processing ---
+data_files = {
+    "train": "/content/train-00000-of-00001-9f9c0f357550859b.parquet",
+    "test": "/content/test-00000-of-00001-03c1ffa375dc14db.parquet"
+}
+
+dataset = load_dataset("parquet", data_files=data_files)
+
+save_path = "/content/OSCD_dataset"
+
+for split in ["train", "test"]:
+    os.makedirs(f"{save_path}/{split}/A", exist_ok=True)
+    os.makedirs(f"{save_path}/{split}/B", exist_ok=True)
+    os.makedirs(f"{save_path}/{split}/label", exist_ok=True)
+
+    data = dataset[split]
+
+    for i in range(len(data)):
+        before = Image.fromarray(np.array(data[i]['imageA']))
+        after = Image.fromarray(np.array(data[i]['imageB']))
+        mask = Image.fromarray(np.array(data[i]['label']))
+
+        before.save(f"{save_path}/{split}/A/{i}.png")
+        after.save(f"{save_path}/{split}/B/{i}.png")
+        mask.save(f"{save_path}/{split}/label/{i}.png")
+# --- End of added code ---
+
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using:", device)
+
+############################################
+# DATASET
+############################################
+
+class ChangeDataset(Dataset):
+    def __init__(self, root):
+        self.A_path = os.path.join(root, "A")
+        self.B_path = os.path.join(root, "B")
+        self.label_path = os.path.join(root, "label")
+        self.files = os.listdir(self.A_path)
+
+        self.transform = transforms.Compose([
+            transforms.Resize((256,256)),
+            transforms.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+
+        file = self.files[idx]
+
+        A = self.transform(Image.open(os.path.join(self.A_path,file)).convert("RGB"))
+        B = self.transform(Image.open(os.path.join(self.B_path,file)).convert("RGB"))
+        label = self.transform(Image.open(os.path.join(self.label_path,file)).convert("L"))
+
+        return A,B,label
+
+
+train_dataset = ChangeDataset("/content/OSCD_dataset/train")
+test_dataset = ChangeDataset("/content/OSCD_dataset/test")
+
+train_loader = DataLoader(train_dataset,batch_size=4,shuffle=True)
+test_loader = DataLoader(test_dataset,batch_size=1,shuffle=False)
+
+############################################
+# ENCODER
+############################################
+
+class Encoder(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3,32,3,padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(32,64,3,padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+
+    def forward(self,x):
+
+        f1 = self.conv1(x)
+        f2 = self.conv2(f1)
+
+        return f1,f2
+
+############################################
+# SIAMESE UNET
+############################################
+
+class SiameseUNet(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+        self.encoder = Encoder()
+
+        self.up1 = nn.ConvTranspose2d(64,32,2,stride=2)
+
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(64,32,3,padding=1),
+            nn.ReLU()
+        )
+
+        self.up2 = nn.ConvTranspose2d(32,16,2,stride=2)
+
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(16,16,3,padding=1),
+            nn.ReLU()
+        )
+
+        self.out = nn.Conv2d(16,1,1)
+
+    def forward(self,A,B):
+
+        A1,A2 = self.encoder(A)
+        B1,B2 = self.encoder(B)
+
+        diff2 = torch.abs(A2-B2)
+        diff1 = torch.abs(A1-B1)
+
+        x = self.up1(diff2)
+        x = torch.cat([x,diff1],dim=1)
+        x = self.conv1(x)
+
+        x = self.up2(x)
+        x = self.conv2(x)
+
+        return self.out(x)
+
+############################################
+# MODEL SETUP
+############################################
+
+model = SiameseUNet().to(device)
+
+criterion = nn.BCEWithLogitsLoss()
+
+optimizer = optim.Adam(model.parameters(),lr=0.001)
+
+epochs = 50
+
+train_losses = []
+
+############################################
+# TRAINING
+############################################
+
+for epoch in range(epochs):
+
+    model.train()
+
+    total_loss = 0
+
+    for A,B,y in train_loader:
+
+        A,B,y = A.to(device),B.to(device),y.to(device)
+
+        pred = model(A,B)
+
+        loss = criterion(pred,y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    avg_loss = total_loss/len(train_loader)
+
+    train_losses.append(avg_loss)
+
+    print(f"Epoch {epoch+1}/{epochs} Loss:{avg_loss:.4f}")
+torch.save(model.state_dict(), "model.pth")
+print("Model saved as model.pth")
+
+############################################
+# LOSS GRAPH
+############################################
+
+plt.plot(train_losses)
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Training Loss Curve")
+plt.show()
+
+############################################
+# MODEL EVALUATION
+############################################
+
+model.eval()
+
+y_true=[]
+y_pred=[]
+
+with torch.no_grad():
+
+    for A,B,y in test_loader:
+
+        A,B,y = A.to(device),B.to(device),y.to(device)
+
+        pred = model(A,B)
+
+        pred = torch.sigmoid(pred)
+
+        pred = (pred>0.5).float()
+
+        y_true.extend(y.cpu().numpy().flatten())
+        y_pred.extend(pred.cpu().numpy().flatten())
+
+print("Accuracy:",accuracy_score(y_true,y_pred))
+print("Precision:",precision_score(y_true,y_pred))
+print("Recall:",recall_score(y_true,y_pred))
+print("F1 Score:",f1_score(y_true,y_pred))
+
+############################################
+# DAMAGE VISUALIZATION
+############################################
+
+A,B,y = next(iter(test_loader))
+
+before = A.squeeze().permute(1,2,0).numpy()
+after = B.squeeze().permute(1,2,0).numpy()
+
+pred = model(A.to(device),B.to(device))
+
+pred = torch.sigmoid(pred)
+
+mask = pred.squeeze().cpu().detach().numpy()
+
+mask = mask>0.5
+
+damage_ratio = mask.sum()/mask.size
+
+if damage_ratio < 0.01:
+
+    label = "No Damage"
+    color = [0,255,0]
+
+elif damage_ratio < 0.05:
+
+    label = "Minor Damage"
+    color = [255,255,0]
+
+else:
+
+    label = "Major Damage"
+    color = [255,0,0]
+
+rgb = np.zeros((mask.shape[0],mask.shape[1],3),dtype=np.uint8)
+
+for i in range(3):
+    rgb[:,:,i] = mask*color[i]
+
+plt.figure(figsize=(12,4))
+
+plt.subplot(1,3,1)
+plt.imshow(before)
+plt.title("Before")
+
+plt.subplot(1,3,2)
+plt.imshow(after)
+plt.title("After")
+
+plt.subplot(1,3,3)
+plt.imshow(rgb)
+plt.title(label)
+
+plt.show()
